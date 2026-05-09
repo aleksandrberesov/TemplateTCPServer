@@ -1,6 +1,7 @@
 #include "Server.h"
 
-#include "EcgGenerator.h"
+#include "CommandDispatcher.h"
+#include "ICommandHandler.h"
 #include "Protocol.h"
 
 #include <atomic>
@@ -27,6 +28,7 @@
 #else
   #include <arpa/inet.h>
   #include <errno.h>
+  #include <netdb.h>
   #include <netinet/in.h>
   #include <sys/socket.h>
   #include <sys/types.h>
@@ -64,19 +66,37 @@ void logLine(const std::string& s) {
     std::cout << s << std::endl;
 }
 
-class ClientSession {
+std::vector<std::string> getLocalIPs() {
+    char hostname[256];
+    if (::gethostname(hostname, sizeof(hostname)) != 0) return {};
+    addrinfo hints{}, *res = nullptr;
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (::getaddrinfo(hostname, nullptr, &hints, &res) != 0) return {};
+    std::vector<std::string> ips;
+    for (auto* r = res; r; r = r->ai_next) {
+        char buf[INET_ADDRSTRLEN];
+        auto* sin = reinterpret_cast<sockaddr_in*>(r->ai_addr);
+        if (::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)))
+            ips.emplace_back(buf);
+    }
+    ::freeaddrinfo(res);
+    return ips;
+}
+
+class ClientSession : public tts::IClientContext {
 public:
-    ClientSession(socket_t s, std::string peer, int defaultRate, int batchSize, bool quiet,
-                  std::string uploadDir, long long maxUploadBytes)
-        : sock_(s), peer_(std::move(peer)),
-          defaultRate_(defaultRate), batchSize_(batchSize), quiet_(quiet),
-          uploadDir_(std::move(uploadDir)), maxUploadBytes_(maxUploadBytes) {}
+    ClientSession(socket_t s, std::string peer, bool quiet,
+                  std::string uploadDir, long long maxUploadBytes,
+                  tts::CommandDispatcher* dispatcher)
+        : sock_(s), peer_(std::move(peer)), quiet_(quiet),
+          uploadDir_(std::move(uploadDir)), maxUploadBytes_(maxUploadBytes),
+          dispatcher_(dispatcher) {}
 
     ClientSession(const ClientSession&)            = delete;
     ClientSession& operator=(const ClientSession&) = delete;
 
     ~ClientSession() {
-        stopGenerator();
         if (sock_ != kInvalidSock) TTS_CLOSESOCK(sock_);
     }
 
@@ -85,26 +105,24 @@ public:
 private:
     socket_t    sock_;
     std::string peer_;
-    int         defaultRate_;
-    int         batchSize_;
     bool        quiet_;
-    std::string uploadDir_;
-    long long   maxUploadBytes_;
+    std::string             uploadDir_;
+    long long               maxUploadBytes_;
+    tts::CommandDispatcher* dispatcher_;
 
     std::mutex            writeMu_;
     std::atomic<bool>     sessionAlive_{true};
 
-    std::thread           genThread_;
-    std::atomic<bool>     genStop_{false};
-
     struct PendingUpload { std::string filename; long long size; std::optional<std::string> id; };
+
+    // IClientContext
+    void sendJson(const tts::json::Value& msg) override { sendLine(msg.dump()); }
+    const std::string& peerAddress() const override { return peer_; }
 
     void log(const std::string& s) const { if (!quiet_) logLine(s); }
 
     bool sendLine(const std::string& s);
     std::optional<PendingUpload> handleMessage(const protocol::Message& msg);
-    void startGenerator(int rate, std::optional<std::string> requestId);
-    void stopGenerator();
     void receiveUpload(const std::string& rawFilename, long long size,
                        const std::optional<std::string>& id, std::string& buf);
 };
@@ -165,6 +183,7 @@ void ClientSession::run() {
 
             std::optional<PendingUpload> pending;
             try {
+                log("[" + peer_ + "] recv raw: " + line);
                 protocol::Message msg = protocol::decode(line);
                 pending = handleMessage(msg);
             } catch (const protocol::ProtocolError& e) {
@@ -188,7 +207,6 @@ void ClientSession::run() {
     }
 
     sessionAlive_ = false;
-    stopGenerator();
     log("[" + peer_ + "] disconnected");
 }
 
@@ -196,17 +214,12 @@ std::optional<ClientSession::PendingUpload> ClientSession::handleMessage(const p
     using protocol::Message;
     log("[" + peer_ + "] recv: " + std::string(msg.typeStr()) +
         (msg.id ? " id=" + *msg.id : ""));
-
-    switch (msg.messageType) {
+     
+    switch (msg.messageType) { 
         case Message::Type::Start: {
-            int rate = msg.sampleRate.value_or(defaultRate_);
-            if (rate <= 0) rate = defaultRate_ > 0 ? defaultRate_ : 250;
-            stopGenerator();
-            startGenerator(rate, msg.id);
             return std::nullopt;
         }
         case Message::Type::Stop:
-            stopGenerator();
             return std::nullopt;
         case Message::Type::Upload:
             return PendingUpload{
@@ -219,43 +232,6 @@ std::optional<ClientSession::PendingUpload> ClientSession::handleMessage(const p
             return std::nullopt;
     }
     return std::nullopt;
-}
-
-void ClientSession::startGenerator(int rate, std::optional<std::string> requestId) {
-    int batch = batchSize_ > 0 ? batchSize_ : 25;
-    genStop_  = false;
-
-    log("[" + peer_ + "] generator starting @ " + std::to_string(rate) +
-        " Hz, batch=" + std::to_string(batch));
-
-    genThread_ = std::thread([this, rate, batch, requestId]() {
-        EcgGenerator gen(rate);
-        int                 offset = 0;
-        const std::string   identy = "sim-" + std::to_string(
-            static_cast<long long>(std::chrono::steady_clock::now().time_since_epoch().count()) % 100000);
-        const auto interval = std::chrono::microseconds(
-            static_cast<long long>(1'000'000.0 * batch / rate));
-        auto next = std::chrono::steady_clock::now();
-
-        while (!genStop_ && sessionAlive_) {
-            std::vector<float> samples = gen.next(batch);
-            auto msg = protocol::Message::makePoints(
-                requestId, protocol::Lead::II, identy, offset, samples);
-            std::string line = protocol::encode(msg);
-            if (!sendLine(line)) {
-                sessionAlive_ = false;
-                break;
-            }
-            offset += batch;
-            next   += interval;
-            std::this_thread::sleep_until(next);
-        }
-    });
-}
-
-void ClientSession::stopGenerator() {
-    genStop_ = true;
-    if (genThread_.joinable()) genThread_.join();
 }
 
 namespace {
@@ -377,8 +353,7 @@ int Server::run() {
     ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
                  reinterpret_cast<const char*>(&yes), sizeof(yes));
 
-    // Best-effort send timeout so a stuck peer eventually unblocks the
-    // generator thread (5 seconds).
+    // Best-effort send timeout so a stuck peer eventually unblocks (5 seconds).
 #ifdef _WIN32
     DWORD sndto = 5000;
     ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
@@ -421,10 +396,22 @@ int Server::run() {
                              opts_.uploadDir.c_str(), ec.message().c_str());
     }
 
-    logLine("TemplateTCPServer listening on " + opts_.host +
-            ":" + std::to_string(opts_.port) +
-            " (rate=" + std::to_string(opts_.sampleRate) +
-            ", batch=" + std::to_string(opts_.batchSize) + ")");
+    {
+        std::string msg = "TemplateTCPServer listening on " + opts_.host +
+                          ":" + std::to_string(opts_.port);
+
+        if (opts_.host == "0.0.0.0" || opts_.host.empty()) {
+            auto ips = getLocalIPs();
+            if (!ips.empty()) {
+                msg += "\nConnect clients to:";
+                for (const auto& ip : ips)
+                    msg += "\n  " + ip + ":" + std::to_string(opts_.port);
+            }
+        } else {
+            msg += "\nConnect clients to: " + opts_.host + ":" + std::to_string(opts_.port);
+        }
+        logLine(msg);
+    }
 
     while (!stopping_) {
         sockaddr_in peer{};
@@ -444,8 +431,8 @@ int Server::run() {
         std::string peerStr = std::string(ip) + ":" + std::to_string(ntohs(peer.sin_port));
 
         std::thread([cs, peerStr, this]() {
-            ClientSession sess(cs, peerStr, opts_.sampleRate, opts_.batchSize, opts_.quiet,
-                               opts_.uploadDir, opts_.maxUploadBytes);
+            ClientSession sess(cs, peerStr, opts_.quiet,
+                               opts_.uploadDir, opts_.maxUploadBytes, opts_.dispatcher);
             sess.run();
         }).detach();
     }

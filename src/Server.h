@@ -4,16 +4,20 @@
 #include <cstdint>
 #include <string>
 
+namespace tts { class CommandDispatcher; }
+
 namespace tts::server {
 
 struct Options {
     std::string host            = "0.0.0.0";
     uint16_t    port            = 9000;
-    int         sampleRate      = 250;
-    int         batchSize       = 25;
     bool        quiet           = false;
     std::string uploadDir       = "uploads";
     long long   maxUploadBytes  = 100LL * 1024 * 1024;
+
+    // Optional command dispatcher — not owned by Options.
+    // Set this before calling Server::run() to handle incoming "command" messages.
+    tts::CommandDispatcher* dispatcher = nullptr;
 };
 
 class Server {

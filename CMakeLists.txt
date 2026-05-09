@@ -14,7 +14,7 @@ add_executable(TemplateTCPServer
     src/Json.cpp
     src/Protocol.cpp
     src/Server.cpp
-    src/EcgGenerator.cpp
+    src/CommandDispatcher.cpp
 )
 
 target_include_directories(TemplateTCPServer PRIVATE src)
