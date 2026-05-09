@@ -25,8 +25,10 @@ void usage(const char* prog) {
         "  --port PORT   listen port           (default 9000)\n"
         "  --rate HZ     default sample rate   (default 250)\n"
         "  --batch N     samples per frame     (default 25)\n"
-        "  --quiet       reduce logging\n"
-        "  -h, --help    show this help\n",
+        "  --upload-dir DIR    directory to save uploads  (default uploads)\n"
+        "  --max-upload-mb N   reject uploads larger than N MB (default 100)\n"
+        "  --quiet             reduce logging\n"
+        "  -h, --help          show this help\n",
         prog);
 }
 
@@ -45,11 +47,13 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
-        else if (a == "--host")  opts.host       = need("--host");
-        else if (a == "--port")  opts.port       = static_cast<uint16_t>(std::atoi(need("--port")));
-        else if (a == "--rate")  opts.sampleRate = std::atoi(need("--rate"));
-        else if (a == "--batch") opts.batchSize  = std::atoi(need("--batch"));
-        else if (a == "--quiet") opts.quiet      = true;
+        else if (a == "--host")          opts.host           = need("--host");
+        else if (a == "--port")          opts.port           = static_cast<uint16_t>(std::atoi(need("--port")));
+        else if (a == "--rate")          opts.sampleRate     = std::atoi(need("--rate"));
+        else if (a == "--batch")         opts.batchSize      = std::atoi(need("--batch"));
+        else if (a == "--quiet")         opts.quiet          = true;
+        else if (a == "--upload-dir")    opts.uploadDir      = need("--upload-dir");
+        else if (a == "--max-upload-mb") opts.maxUploadBytes = static_cast<long long>(std::atoi(need("--max-upload-mb"))) * 1024 * 1024;
         else {
             std::fprintf(stderr, "Unknown option: %s\n", a.c_str());
             usage(argv[0]);

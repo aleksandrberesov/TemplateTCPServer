@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -65,9 +66,11 @@ void logLine(const std::string& s) {
 
 class ClientSession {
 public:
-    ClientSession(socket_t s, std::string peer, int defaultRate, int batchSize, bool quiet)
+    ClientSession(socket_t s, std::string peer, int defaultRate, int batchSize, bool quiet,
+                  std::string uploadDir, long long maxUploadBytes)
         : sock_(s), peer_(std::move(peer)),
-          defaultRate_(defaultRate), batchSize_(batchSize), quiet_(quiet) {}
+          defaultRate_(defaultRate), batchSize_(batchSize), quiet_(quiet),
+          uploadDir_(std::move(uploadDir)), maxUploadBytes_(maxUploadBytes) {}
 
     ClientSession(const ClientSession&)            = delete;
     ClientSession& operator=(const ClientSession&) = delete;
@@ -85,6 +88,8 @@ private:
     int         defaultRate_;
     int         batchSize_;
     bool        quiet_;
+    std::string uploadDir_;
+    long long   maxUploadBytes_;
 
     std::mutex            writeMu_;
     std::atomic<bool>     sessionAlive_{true};
@@ -92,12 +97,16 @@ private:
     std::thread           genThread_;
     std::atomic<bool>     genStop_{false};
 
+    struct PendingUpload { std::string filename; long long size; std::optional<std::string> id; };
+
     void log(const std::string& s) const { if (!quiet_) logLine(s); }
 
     bool sendLine(const std::string& s);
-    void handleMessage(const protocol::Message& msg);
+    std::optional<PendingUpload> handleMessage(const protocol::Message& msg);
     void startGenerator(int rate, std::optional<std::string> requestId);
     void stopGenerator();
+    void receiveUpload(const std::string& rawFilename, long long size,
+                       const std::optional<std::string>& id, std::string& buf);
 };
 
 bool ClientSession::sendLine(const std::string& s) {
@@ -154,11 +163,20 @@ void ClientSession::run() {
             }
             if (blank) continue;
 
+            std::optional<PendingUpload> pending;
             try {
                 protocol::Message msg = protocol::decode(line);
-                handleMessage(msg);
+                pending = handleMessage(msg);
             } catch (const protocol::ProtocolError& e) {
                 log("[" + peer_ + "] decode error: " + e.what() + " (line: " + line + ")");
+            }
+
+            if (pending) {
+                buf.erase(0, lineStart);
+                receiveUpload(pending->filename, pending->size, pending->id, buf);
+                lineStart = 0;
+                buf.clear();
+                break;
             }
         }
         if (lineStart > 0) buf.erase(0, lineStart);
@@ -174,7 +192,7 @@ void ClientSession::run() {
     log("[" + peer_ + "] disconnected");
 }
 
-void ClientSession::handleMessage(const protocol::Message& msg) {
+std::optional<ClientSession::PendingUpload> ClientSession::handleMessage(const protocol::Message& msg) {
     using protocol::Message;
     log("[" + peer_ + "] recv: " + std::string(msg.typeStr()) +
         (msg.id ? " id=" + *msg.id : ""));
@@ -185,16 +203,22 @@ void ClientSession::handleMessage(const protocol::Message& msg) {
             if (rate <= 0) rate = defaultRate_ > 0 ? defaultRate_ : 250;
             stopGenerator();
             startGenerator(rate, msg.id);
-            break;
+            return std::nullopt;
         }
         case Message::Type::Stop:
             stopGenerator();
-            break;
+            return std::nullopt;
+        case Message::Type::Upload:
+            return PendingUpload{
+                msg.filename.value_or("upload.bin"),
+                msg.size.value_or(0),
+                msg.id
+            };
         case Message::Type::Points:
-            // The test server doesn't act on inbound points; logging above
-            // is enough.
-            break;
+        case Message::Type::Ack:
+            return std::nullopt;
     }
+    return std::nullopt;
 }
 
 void ClientSession::startGenerator(int rate, std::optional<std::string> requestId) {
@@ -232,6 +256,102 @@ void ClientSession::startGenerator(int rate, std::optional<std::string> requestI
 void ClientSession::stopGenerator() {
     genStop_ = true;
     if (genThread_.joinable()) genThread_.join();
+}
+
+namespace {
+
+std::string sanitizeFilename(const std::string& raw) {
+    size_t slash = raw.find_last_of("/\\");
+    std::string name = (slash == std::string::npos) ? raw : raw.substr(slash + 1);
+    if (name.empty() || name == "." || name == "..") return "";
+    std::string out;
+    out.reserve(name.size());
+    for (unsigned char c : name) {
+        if (c < 32 || c == ':' || c == '*' || c == '?' || c == '"' ||
+            c == '<' || c == '>' || c == '|' || c == '\\' || c == '/')
+            out += '_';
+        else
+            out += static_cast<char>(c);
+    }
+    for (char c : out) if (c != '_') return out;
+    return "";
+}
+
+}  // namespace
+
+void ClientSession::receiveUpload(const std::string& rawFilename, long long size,
+                                  const std::optional<std::string>& id, std::string& buf) {
+    std::string filename = sanitizeFilename(rawFilename);
+    if (filename.empty()) {
+        log("[" + peer_ + "] upload rejected: invalid filename '" + rawFilename + "'");
+        sessionAlive_ = false;
+        return;
+    }
+    if (size > maxUploadBytes_) {
+        log("[" + peer_ + "] upload rejected: size " + std::to_string(size) +
+            " exceeds limit " + std::to_string(maxUploadBytes_));
+        sessionAlive_ = false;
+        return;
+    }
+
+    std::filesystem::path basePath = std::filesystem::path(uploadDir_) / filename;
+    auto stem = basePath.stem().string();
+    auto ext  = basePath.extension().string();
+
+    std::FILE* f = nullptr;
+    std::filesystem::path path;
+    for (int n = 0; n <= 9999 && !f; ++n) {
+        path = (n == 0) ? basePath
+                        : std::filesystem::path(uploadDir_) / (stem + "_" + std::to_string(n) + ext);
+#ifdef _WIN32
+        fopen_s(&f, path.string().c_str(), "wbx");
+#else
+        f = std::fopen(path.string().c_str(), "wbx");
+#endif
+        if (!f && errno != EEXIST) break;
+    }
+    if (!f) {
+        log("[" + peer_ + "] upload failed: cannot open '" + path.string() + "'");
+        sessionAlive_ = false;
+        return;
+    }
+    filename = path.filename().string();
+
+    log("[" + peer_ + "] upload started: " + filename + " (" + std::to_string(size) + " bytes)");
+
+    long long remaining = size;
+
+    if (!buf.empty()) {
+        long long avail = std::min(static_cast<long long>(buf.size()), remaining);
+        std::fwrite(buf.data(), 1, static_cast<size_t>(avail), f);
+        remaining -= avail;
+        buf.erase(0, static_cast<size_t>(avail));
+    }
+
+    char chunk[65536];
+    while (remaining > 0 && sessionAlive_) {
+        int toRead = static_cast<int>(std::min(static_cast<long long>(sizeof(chunk)), remaining));
+        int n = ::recv(sock_, chunk,
+#ifdef _WIN32
+                       toRead,
+#else
+                       static_cast<size_t>(toRead),
+#endif
+                       0);
+        if (n <= 0) {
+            log("[" + peer_ + "] upload interrupted after " +
+                std::to_string(size - remaining) + " bytes");
+            std::fclose(f);
+            sessionAlive_ = false;
+            return;
+        }
+        std::fwrite(chunk, 1, static_cast<size_t>(n), f);
+        remaining -= n;
+    }
+
+    std::fclose(f);
+    log("[" + peer_ + "] upload complete: " + filename + " (" + std::to_string(size) + " bytes)");
+    sendLine(protocol::encode(protocol::Message::makeAck(id, filename, size)));
 }
 
 }  // namespace
@@ -294,6 +414,13 @@ int Server::run() {
         return 1;
     }
 
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(opts_.uploadDir, ec);
+        if (ec) std::fprintf(stderr, "Warning: cannot create upload dir '%s': %s\n",
+                             opts_.uploadDir.c_str(), ec.message().c_str());
+    }
+
     logLine("TemplateTCPServer listening on " + opts_.host +
             ":" + std::to_string(opts_.port) +
             " (rate=" + std::to_string(opts_.sampleRate) +
@@ -317,7 +444,8 @@ int Server::run() {
         std::string peerStr = std::string(ip) + ":" + std::to_string(ntohs(peer.sin_port));
 
         std::thread([cs, peerStr, this]() {
-            ClientSession sess(cs, peerStr, opts_.sampleRate, opts_.batchSize, opts_.quiet);
+            ClientSession sess(cs, peerStr, opts_.sampleRate, opts_.batchSize, opts_.quiet,
+                               opts_.uploadDir, opts_.maxUploadBytes);
             sess.run();
         }).detach();
     }

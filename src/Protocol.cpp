@@ -86,11 +86,31 @@ Message Message::makePoints(std::optional<std::string> id,
     return m;
 }
 
+Message Message::makeUpload(std::optional<std::string> id, std::string filename, long long size) {
+    Message m;
+    m.messageType = Type::Upload;
+    m.id       = std::move(id);
+    m.filename = std::move(filename);
+    m.size     = size;
+    return m;
+}
+
+Message Message::makeAck(std::optional<std::string> id, std::optional<std::string> filename, std::optional<long long> bytes) {
+    Message m;
+    m.messageType = Type::Ack;
+    m.id       = std::move(id);
+    m.filename = std::move(filename);
+    m.bytes    = bytes;
+    return m;
+}
+
 const char* Message::typeStr() const {
     switch (messageType) {
         case Type::Start:  return "start";
         case Type::Stop:   return "stop";
         case Type::Points: return "points";
+        case Type::Upload: return "upload";
+        case Type::Ack:    return "ack";
     }
     return "?";
 }
@@ -114,6 +134,14 @@ std::string encode(const Message& msg) {
             break;
         }
         case Message::Type::Stop:
+            break;
+        case Message::Type::Upload:
+            if (msg.filename) obj["filename"] = Value(*msg.filename);
+            if (msg.size)     obj["size"]     = Value(*msg.size);
+            break;
+        case Message::Type::Ack:
+            if (msg.filename) obj["filename"] = Value(*msg.filename);
+            if (msg.bytes)    obj["bytes"]    = Value(*msg.bytes);
             break;
         case Message::Type::Points: {
             if (msg.lead.has_value()) {
@@ -140,11 +168,12 @@ std::optional<std::string> getOptString(const tts::json::Value& obj, const std::
     return v->toString();
 }
 
-std::optional<int> getOptInt(const tts::json::Value& obj, const std::string& key) {
+template <typename T>
+std::optional<T> getOptNumber(const tts::json::Value& obj, const std::string& key) {
     const auto* v = obj.find(key);
     if (!v || v->isNull()) return std::nullopt;
     if (!v->isNumber()) throw ProtocolError("Field '" + key + "' must be number");
-    return static_cast<int>(v->toInt());
+    return static_cast<T>(v->toInt());
 }
 
 std::string primitiveToString(const tts::json::Value& v) {
@@ -178,7 +207,7 @@ Message decode(const std::string& json) {
 
     if (*typeOpt == "start") {
         Message m = Message::makeStart(id);
-        m.sampleRate = getOptInt(root, "sampleRate");
+        m.sampleRate = getOptNumber<int>(root, "sampleRate");
         const auto* p = root.find("params");
         if (p && !p->isNull()) {
             if (!p->isObject()) throw ProtocolError("Field 'params' must be object");
@@ -202,7 +231,7 @@ Message decode(const std::string& json) {
             m.lead = *parsed;
         }
         m.identy = getOptString(root, "identy");
-        if (auto off = getOptInt(root, "offset")) m.offset = *off;
+        if (auto off = getOptNumber<int>(root, "offset")) m.offset = *off;
         const auto* vals = root.find("values");
         if (!vals || vals->isNull()) throw ProtocolError("Missing required field: values");
         if (!vals->isArray())        throw ProtocolError("Field 'values' must be array");
@@ -216,6 +245,19 @@ Message decode(const std::string& json) {
             ++idx;
         }
         return m;
+    }
+    if (*typeOpt == "upload") {
+        auto filename = getOptString(root, "filename");
+        if (!filename) throw ProtocolError("Missing required field: filename");
+        auto size = getOptNumber<long long>(root, "size");
+        if (!size)     throw ProtocolError("Missing required field: size");
+        if (*size < 0) throw ProtocolError("Field 'size' must be non-negative");
+        return Message::makeUpload(id, *filename, *size);
+    }
+    if (*typeOpt == "ack") {
+        return Message::makeAck(id,
+                                getOptString(root, "filename"),
+                                getOptNumber<long long>(root, "bytes"));
     }
     throw ProtocolError("Unknown message type: " + *typeOpt);
 }

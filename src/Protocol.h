@@ -19,7 +19,7 @@ const char*          leadName(Lead lead);
 std::optional<Lead>  parseLead(const std::string& token);
 
 struct Message {
-    enum class Type { Start, Stop, Points };
+    enum class Type { Start, Stop, Points, Upload, Ack };
 
     Type                       messageType = Type::Stop;
     std::optional<std::string> id;
@@ -34,6 +34,10 @@ struct Message {
     int                        offset = 0;
     std::vector<float>         values;
 
+    std::optional<std::string> filename;
+    std::optional<long long>   size;
+    std::optional<long long>   bytes;
+
     static Message makeStart(std::optional<std::string> id = std::nullopt,
                              std::optional<int> sampleRate = std::nullopt,
                              std::map<std::string, std::string> params = {});
@@ -43,6 +47,12 @@ struct Message {
                               std::optional<std::string> identy,
                               int                        offset,
                               std::vector<float>         values);
+    static Message makeUpload(std::optional<std::string> id,
+                              std::string                filename,
+                              long long                  size);
+    static Message makeAck(std::optional<std::string> id,
+                           std::optional<std::string> filename,
+                           std::optional<long long>   bytes);
 
     const char* typeStr() const;
 };

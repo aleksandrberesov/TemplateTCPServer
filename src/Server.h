@@ -7,11 +7,13 @@
 namespace tts::server {
 
 struct Options {
-    std::string host       = "0.0.0.0";
-    uint16_t    port       = 9000;
-    int         sampleRate = 250;   // default rate when client's start has none
-    int         batchSize  = 25;    // samples per points frame
-    bool        quiet      = false;
+    std::string host            = "0.0.0.0";
+    uint16_t    port            = 9000;
+    int         sampleRate      = 250;
+    int         batchSize       = 25;
+    bool        quiet           = false;
+    std::string uploadDir       = "uploads";
+    long long   maxUploadBytes  = 100LL * 1024 * 1024;
 };
 
 class Server {
