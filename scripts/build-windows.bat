@@ -4,6 +4,8 @@ rem (MSVC if running from a Developer Command Prompt, otherwise MinGW
 rem if g++ is on PATH). Usage: scripts\build-windows.bat [extra cmake args]
 setlocal
 
+if exist "C:\Program Files\CMake\bin\cmake.exe" set "PATH=C:\Program Files\CMake\bin;%PATH%"
+
 set "ROOT=%~dp0.."
 set "BUILD=%ROOT%\build\windows"
 
