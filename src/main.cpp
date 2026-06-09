@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
             ctx.sendJson(tts::json::Value(std::move(resp)));
         });
 
-    dispatcher.registerHandler("startTask",
+    dispatcher.registerHandler("start",
         [](const tts::json::Value& payload, tts::IClientContext& ctx) {
             const auto* name = payload.find("name");
             std::string taskName = (name && name->isString()) ? name->toString() : "<unnamed>";
@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
                       << " | peer: " << ctx.peerAddress() << "\n";
         });
 
-    dispatcher.registerHandler("stopTask",
+    dispatcher.registerHandler("stop",
         [](const tts::json::Value& payload, tts::IClientContext& ctx) {
             const auto* name = payload.find("name");
             std::string taskName = (name && name->isString()) ? name->toString() : "<unnamed>";
