@@ -53,6 +53,30 @@ std::optional<Lead> parseLead(const std::string& token) {
     return std::nullopt;
 }
 
+Message Message::makeQuery(std::optional<std::string> id,
+                           std::string                pathology,
+                           std::optional<std::string> hash) {
+    Message m;
+    m.messageType = Type::Query;
+    m.id          = std::move(id);
+    m.pathology   = std::move(pathology);
+    m.hash        = std::move(hash);
+    return m;
+}
+
+Message Message::makeRhythm(std::optional<std::string> id,
+                            std::string                pathology,
+                            std::optional<int>         sampleRate,
+                            std::map<std::string, std::vector<int>> leads) {
+    Message m;
+    m.messageType = Type::Rhythm;
+    m.id          = std::move(id);
+    m.pathology   = std::move(pathology);
+    m.sampleRate  = sampleRate;
+    m.leads       = std::move(leads);
+    return m;
+}
+
 Message Message::makeStart(std::optional<std::string> id,
                            std::optional<int>         sampleRate,
                            std::map<std::string, std::string> params) {
@@ -106,6 +130,8 @@ Message Message::makeAck(std::optional<std::string> id, std::optional<std::strin
 
 const char* Message::typeStr() const {
     switch (messageType) {
+        case Type::Query:  return "query";
+        case Type::Rhythm: return "rhythm";
         case Type::Start:  return "start";
         case Type::Stop:   return "stop";
         case Type::Points: return "points";
@@ -122,6 +148,25 @@ std::string encode(const Message& msg) {
     if (msg.id.has_value()) obj["id"] = Value(*msg.id);
 
     switch (msg.messageType) {
+        case Message::Type::Query:
+            if (msg.pathology) obj["pathology"] = Value(*msg.pathology);
+            if (msg.hash)      obj["hash"]      = Value(*msg.hash);
+            break;
+        case Message::Type::Rhythm: {
+            if (msg.pathology) obj["pathology"] = Value(*msg.pathology);
+            if (msg.sampleRate.has_value()) {
+                obj["sampleRate"] = Value(static_cast<long long>(*msg.sampleRate));
+            }
+            Value::Object leads;
+            for (const auto& kv : msg.leads) {
+                Value::Array arr;
+                arr.reserve(kv.second.size());
+                for (int v : kv.second) arr.push_back(Value(static_cast<long long>(v)));
+                leads[kv.first] = Value(std::move(arr));
+            }
+            obj["leads"] = Value(std::move(leads));
+            break;
+        }
         case Message::Type::Start: {
             if (msg.sampleRate.has_value()) {
                 obj["sampleRate"] = Value(static_cast<long long>(*msg.sampleRate));
@@ -205,6 +250,37 @@ Message decode(const std::string& json) {
     if (!typeOpt) throw ProtocolError("Missing required field: type");
     auto id = getOptString(root, "id");
 
+    if (*typeOpt == "query") {
+        auto pathology = getOptString(root, "pathology");
+        if (!pathology) throw ProtocolError("Missing required field: pathology");
+        return Message::makeQuery(id, *pathology, getOptString(root, "hash"));
+    }
+    if (*typeOpt == "rhythm") {
+        auto pathology = getOptString(root, "pathology");
+        if (!pathology) throw ProtocolError("Missing required field: pathology");
+        Message m = Message::makeRhythm(id, *pathology,
+                                        getOptNumber<int>(root, "sampleRate"), {});
+        const auto* leads = root.find("leads");
+        if (!leads || leads->isNull()) throw ProtocolError("Missing required field: leads");
+        if (!leads->isObject())        throw ProtocolError("Field 'leads' must be object");
+        for (const auto& kv : leads->toObject()) {
+            if (!parseLead(kv.first)) throw ProtocolError("Unknown lead: " + kv.first);
+            if (!kv.second.isArray()) throw ProtocolError("Lead '" + kv.first + "' must be an array");
+            std::vector<int> samples;
+            samples.reserve(kv.second.toArray().size());
+            size_t idx = 0;
+            for (const auto& v : kv.second.toArray()) {
+                if (!v.isNumber()) {
+                    throw ProtocolError("Invalid number in lead '" + kv.first +
+                                        "' at index " + std::to_string(idx));
+                }
+                samples.push_back(static_cast<int>(v.toInt()));
+                ++idx;
+            }
+            m.leads[leadName(*parseLead(kv.first))] = std::move(samples);
+        }
+        return m;
+    }
     if (*typeOpt == "start") {
         Message m = Message::makeStart(id);
         m.sampleRate = getOptNumber<int>(root, "sampleRate");

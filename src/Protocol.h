@@ -19,16 +19,27 @@ const char*          leadName(Lead lead);
 std::optional<Lead>  parseLead(const std::string& token);
 
 struct Message {
-    enum class Type { Start, Stop, Points, Upload, Ack };
+    // Query  — cache probe (app → server), replied to with OK/no_data.
+    // Rhythm — the whole record's raw samples in one message (app → server).
+    // Start  — play command only (app → server); no reply.
+    // Points — DEPRECATED: former streamed frames, still decodable for compat.
+    enum class Type { Query, Rhythm, Start, Stop, Points, Upload, Ack };
 
     Type                       messageType = Type::Stop;
     std::optional<std::string> id;
 
-    // Start
-    std::optional<int>                  sampleRate;
-    std::map<std::string, std::string>  params;
+    // Query / Rhythm — top-level identity of the rhythm.
+    std::optional<std::string> pathology;
+    std::optional<std::string> hash;        // Query only (cache key, §6)
 
-    // Points
+    // Start / Rhythm
+    std::optional<int>                  sampleRate;
+    std::map<std::string, std::string>  params;   // Start: {pathology, name}
+
+    // Rhythm — every stored lead's raw .dat integer samples (baseline ~1024).
+    std::map<std::string, std::vector<int>> leads;
+
+    // Points (deprecated)
     std::optional<Lead>        lead;
     std::optional<std::string> identy;
     int                        offset = 0;
@@ -38,6 +49,13 @@ struct Message {
     std::optional<long long>   size;
     std::optional<long long>   bytes;
 
+    static Message makeQuery(std::optional<std::string> id,
+                             std::string                pathology,
+                             std::optional<std::string> hash = std::nullopt);
+    static Message makeRhythm(std::optional<std::string> id,
+                              std::string                pathology,
+                              std::optional<int>         sampleRate,
+                              std::map<std::string, std::vector<int>> leads);
     static Message makeStart(std::optional<std::string> id = std::nullopt,
                              std::optional<int> sampleRate = std::nullopt,
                              std::map<std::string, std::string> params = {});

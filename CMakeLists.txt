@@ -15,6 +15,7 @@ add_executable(TemplateTCPServer
     src/Protocol.cpp
     src/Server.cpp
     src/CommandDispatcher.cpp
+    src/RhythmCache.cpp
 )
 
 target_include_directories(TemplateTCPServer PRIVATE src)

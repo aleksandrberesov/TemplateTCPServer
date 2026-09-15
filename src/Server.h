@@ -5,6 +5,7 @@
 #include <string>
 
 namespace tts { class CommandDispatcher; }
+namespace tts { class RhythmCache; }
 
 namespace tts::server {
 
@@ -14,9 +15,20 @@ struct Options {
     bool        quiet           = false;
     std::string uploadDir       = "uploads";
     long long   maxUploadBytes  = 100LL * 1024 * 1024;
+    // Max size of a single JSON line. A `rhythm` message carries every lead's
+    // raw samples on one line and can be large, so this is generous.
+    long long   maxLineBytes    = 64LL * 1024 * 1024;
 
-    // Optional command dispatcher — not owned by Options.
-    // Set this before calling Server::run() to handle incoming "command" messages.
+    // Shared rhythm cache backing the §4 handshake — not owned by Options.
+    // Set this before calling Server::run() so every client session shares one
+    // store. When null the server treats every rhythm as un-cached (always
+    // replies "no_data").
+    tts::RhythmCache* cache = nullptr;
+
+    // Optional extensibility hook — not owned by Options. When set, the server
+    // invokes it (by message type: "start", "stop", "points") AFTER it has sent
+    // any mandatory handshake reply, so custom handlers can observe traffic.
+    // Handlers must not send handshake verdicts themselves (see main.cpp).
     tts::CommandDispatcher* dispatcher = nullptr;
 };
 

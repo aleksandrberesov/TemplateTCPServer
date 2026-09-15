@@ -3,6 +3,7 @@
 #include "CommandDispatcher.h"
 #include "ICommandHandler.h"
 #include "Protocol.h"
+#include "RhythmCache.h"
 
 #include <atomic>
 #include <cctype>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -66,6 +68,12 @@ void logLine(const std::string& s) {
     std::cout << s << std::endl;
 }
 
+// A `rhythm` line can be megabytes; keep the log readable.
+std::string truncateForLog(const std::string& s, size_t limit = 240) {
+    if (s.size() <= limit) return s;
+    return s.substr(0, limit) + "…(" + std::to_string(s.size()) + " bytes)";
+}
+
 std::vector<std::string> getLocalIPs() {
     char hostname[256];
     if (::gethostname(hostname, sizeof(hostname)) != 0) return {};
@@ -88,10 +96,11 @@ class ClientSession : public tts::IClientContext {
 public:
     ClientSession(socket_t s, std::string peer, bool quiet,
                   std::string uploadDir, long long maxUploadBytes,
-                  tts::CommandDispatcher* dispatcher)
+                  long long maxLineBytes,
+                  tts::RhythmCache* cache, tts::CommandDispatcher* dispatcher)
         : sock_(s), peer_(std::move(peer)), quiet_(quiet),
           uploadDir_(std::move(uploadDir)), maxUploadBytes_(maxUploadBytes),
-          dispatcher_(dispatcher) {}
+          maxLineBytes_(maxLineBytes), cache_(cache), dispatcher_(dispatcher) {}
 
     ClientSession(const ClientSession&)            = delete;
     ClientSession& operator=(const ClientSession&) = delete;
@@ -108,12 +117,20 @@ private:
     bool        quiet_;
     std::string             uploadDir_;
     long long               maxUploadBytes_;
+    long long               maxLineBytes_;
+    tts::RhythmCache*       cache_;
     tts::CommandDispatcher* dispatcher_;
 
     std::mutex            writeMu_;
     std::atomic<bool>     sessionAlive_{true};
 
     struct PendingUpload { std::string filename; long long size; std::optional<std::string> id; };
+
+    // The (pathology, hash) of the most recent `query` we answered "no_data",
+    // awaiting its single `rhythm` message (§3.3). The `rhythm` message itself
+    // carries no hash, so we remember it here to key the cache entry (§6).
+    struct PendingQuery { std::string pathology; std::string hash; };
+    std::optional<PendingQuery> pendingQuery_;
 
     // IClientContext
     void sendJson(const tts::json::Value& msg) override { sendLine(msg.dump()); }
@@ -125,6 +142,12 @@ private:
     std::optional<PendingUpload> handleMessage(const protocol::Message& msg);
     void receiveUpload(const std::string& rawFilename, long long size,
                        const std::optional<std::string>& id, std::string& buf);
+
+    // Protocol handling.
+    void handleQuery(const protocol::Message& msg);
+    void handleRhythm(const protocol::Message& msg);
+    void sendVerdict(bool cached, const std::optional<std::string>& id);
+    void notifyHandler(const char* type, tts::json::Value payload);
 };
 
 bool ClientSession::sendLine(const std::string& s) {
@@ -146,12 +169,16 @@ bool ClientSession::sendLine(const std::string& s) {
     return true;
 }
 
+// A `rhythm` message (§3.3) is one JSON object on a single, possibly very large
+// line, so avoid re-scanning the incomplete prefix on every recv: `searchPos`
+// remembers how far into `buf` we have already looked for a newline.
 void ClientSession::run() {
     log("[" + peer_ + "] connected");
 
     std::string buf;
-    buf.reserve(4096);
-    char chunk[4096];
+    buf.reserve(1 << 16);
+    char   chunk[1 << 16];
+    size_t searchPos = 0;
 
     while (sessionAlive_) {
         int n = ::recv(sock_, chunk,
@@ -168,11 +195,11 @@ void ClientSession::run() {
         }
         buf.append(chunk, static_cast<size_t>(n));
 
-        size_t lineStart = 0;
-        for (size_t i = 0; i < buf.size(); ++i) {
-            if (buf[i] != '\n') continue;
-            std::string line = buf.substr(lineStart, i - lineStart);
-            lineStart = i + 1;
+        size_t pos;
+        while (sessionAlive_ && (pos = buf.find('\n', searchPos)) != std::string::npos) {
+            std::string line = buf.substr(0, pos);
+            buf.erase(0, pos + 1);   // drop the line and its '\n'
+            searchPos = 0;
             if (!line.empty() && line.back() == '\r') line.pop_back();
 
             bool blank = true;
@@ -183,25 +210,29 @@ void ClientSession::run() {
 
             std::optional<PendingUpload> pending;
             try {
-                log("[" + peer_ + "] recv raw: " + line);
+                log("[" + peer_ + "] recv raw: " + truncateForLog(line));
                 protocol::Message msg = protocol::decode(line);
                 pending = handleMessage(msg);
             } catch (const protocol::ProtocolError& e) {
-                log("[" + peer_ + "] decode error: " + e.what() + " (line: " + line + ")");
+                log("[" + peer_ + "] decode error: " + e.what() +
+                    " (line: " + truncateForLog(line) + ")");
             }
 
             if (pending) {
-                buf.erase(0, lineStart);
+                // Whatever is left in `buf` is the start of the raw payload;
+                // receiveUpload consumes exactly `size` bytes and leaves any
+                // bytes pipelined after it (e.g. the query that follows the
+                // manifest, §2) for the loop below to parse.
                 receiveUpload(pending->filename, pending->size, pending->id, buf);
-                lineStart = 0;
-                buf.clear();
-                break;
+                searchPos = 0;
             }
         }
-        if (lineStart > 0) buf.erase(0, lineStart);
+        // No newline in [searchPos, end): everything scanned, resume from here.
+        searchPos = buf.size();
 
-        if (buf.size() > 1024 * 1024) {
-            log("[" + peer_ + "] line buffer overflow, dropping connection");
+        if (static_cast<long long>(buf.size()) > maxLineBytes_) {
+            log("[" + peer_ + "] line buffer overflow (" + std::to_string(buf.size()) +
+                " > " + std::to_string(maxLineBytes_) + " bytes), dropping connection");
             break;
         }
     }
@@ -214,12 +245,31 @@ std::optional<ClientSession::PendingUpload> ClientSession::handleMessage(const p
     using protocol::Message;
     log("[" + peer_ + "] recv: " + std::string(msg.typeStr()) +
         (msg.id ? " id=" + *msg.id : ""));
-     
-    switch (msg.messageType) { 
+
+    switch (msg.messageType) {
+        case Message::Type::Query:
+            handleQuery(msg);
+            return std::nullopt;
+        case Message::Type::Rhythm:
+            handleRhythm(msg);
+            return std::nullopt;
         case Message::Type::Start: {
+            // Play command only (§3.4) — no reply. Data was delivered earlier
+            // via the query/rhythm handshake.
+            auto it = msg.params.find("pathology");
+            const std::string pathology = (it == msg.params.end()) ? std::string{} : it->second;
+            const bool held = cache_ && cache_->get(pathology).has_value();
+            log("[" + peer_ + "] start (play) pathology='" + pathology + "'" +
+                (pathology.empty() ? "" : (held ? " [cached]" : " [NOT cached]")));
+            tts::json::Value::Object p;
+            p["pathology"] = tts::json::Value(pathology);
+            p["held"]      = tts::json::Value(held);
+            notifyHandler("start", tts::json::Value(std::move(p)));
             return std::nullopt;
         }
         case Message::Type::Stop:
+            log("[" + peer_ + "] stop (monitor stopped)");
+            notifyHandler("stop", tts::json::Value(tts::json::Value::Object{}));
             return std::nullopt;
         case Message::Type::Upload:
             return PendingUpload{
@@ -228,10 +278,94 @@ std::optional<ClientSession::PendingUpload> ClientSession::handleMessage(const p
                 msg.id
             };
         case Message::Type::Points:
+            // Deprecated (§3.7): the app no longer streams frames. Ignore.
+            log("[" + peer_ + "] points ignored: deprecated message, expect 'rhythm' instead");
+            return std::nullopt;
         case Message::Type::Ack:
             return std::nullopt;
     }
     return std::nullopt;
+}
+
+// query — the cache probe (§3.1, §4). Reply with exactly one line: "OK" when the
+// rhythm is already held, "no_data" when its samples must be sent as a `rhythm`.
+void ClientSession::handleQuery(const protocol::Message& msg) {
+    const std::string pathology = msg.pathology.value_or("");
+    const std::string hash      = msg.hash.value_or("");
+
+    const bool cached = cache_ && cache_->contains(pathology, hash);
+    sendVerdict(cached, msg.id);
+
+    log("[" + peer_ + "] query pathology='" + pathology + "' hash='" + hash +
+        "' -> " + (cached ? "OK (cached)" : "no_data (need samples)"));
+
+    // On no_data the app will send exactly one `rhythm` message next. Remember
+    // the queried (pathology, hash) so we can key its cache entry — `rhythm`
+    // itself carries no hash (§3.3).
+    pendingQuery_ = cached ? std::nullopt
+                           : std::optional<PendingQuery>(PendingQuery{pathology, hash});
+
+    tts::json::Value::Object p;
+    p["pathology"] = tts::json::Value(pathology);
+    p["hash"]      = tts::json::Value(hash);
+    p["cached"]    = tts::json::Value(cached);
+    notifyHandler("query", tts::json::Value(std::move(p)));
+}
+
+// rhythm — the whole record in one message (§3.3). Store every lead's raw ADC
+// samples in the shared cache, keyed by the (pathology, hash) from the query
+// that requested it, so the next query for that pair answers "OK".
+void ClientSession::handleRhythm(const protocol::Message& msg) {
+    const std::string pathology = msg.pathology.value_or("");
+    const int sampleRate = msg.sampleRate.value_or(500);
+
+    // The hash comes from the preceding no_data query; fall back to empty
+    // (id-only caching) if the rhythm arrived without one (e.g. fail-open).
+    std::string hash;
+    if (pendingQuery_ && pendingQuery_->pathology == pathology) hash = pendingQuery_->hash;
+    pendingQuery_.reset();
+
+    size_t total = 0;
+    for (const auto& kv : msg.leads) total += kv.second.size();
+    log("[" + peer_ + "] rhythm '" + pathology + "' hash='" + hash + "' (" +
+        std::to_string(msg.leads.size()) + " leads, " + std::to_string(total) +
+        " samples @ " + std::to_string(sampleRate) + " Hz)");
+
+    if (cache_ && !pathology.empty()) {
+        RhythmCache::Rhythm stored;
+        stored.hash       = hash;
+        stored.sampleRate = sampleRate;
+        stored.leads      = msg.leads;
+        cache_->store(pathology, std::move(stored));
+    }
+
+    tts::json::Value::Object p;
+    p["pathology"]  = tts::json::Value(pathology);
+    p["hash"]       = tts::json::Value(hash);
+    p["leads"]      = tts::json::Value(static_cast<long long>(msg.leads.size()));
+    p["samples"]    = tts::json::Value(static_cast<long long>(total));
+    p["sampleRate"] = tts::json::Value(static_cast<long long>(sampleRate));
+    notifyHandler("rhythm", tts::json::Value(std::move(p)));
+}
+
+// Reply to a query with the cache verdict (§3.2). Echoes the request id as JSON
+// when present (recommended), otherwise sends the bare token; the app accepts
+// both. Newline-terminated by sendLine so the app never has to wait out the 4 s
+// fail-open timeout (§4).
+void ClientSession::sendVerdict(bool cached, const std::optional<std::string>& id) {
+    if (id) {
+        tts::json::Value::Object o;
+        o["id"]     = tts::json::Value(*id);
+        o["status"] = tts::json::Value(std::string(cached ? "ok" : "no_data"));
+        sendLine(tts::json::Value(std::move(o)).dump());
+    } else {
+        sendLine(cached ? "OK" : "no_data");
+    }
+}
+
+// Fire the optional extensibility hook after the mandatory reply has been sent.
+void ClientSession::notifyHandler(const char* type, tts::json::Value payload) {
+    if (dispatcher_) dispatcher_->dispatch(type, payload, *this);
 }
 
 namespace {
@@ -432,7 +566,8 @@ int Server::run() {
 
         std::thread([cs, peerStr, this]() {
             ClientSession sess(cs, peerStr, opts_.quiet,
-                               opts_.uploadDir, opts_.maxUploadBytes, opts_.dispatcher);
+                               opts_.uploadDir, opts_.maxUploadBytes, opts_.maxLineBytes,
+                               opts_.cache, opts_.dispatcher);
             sess.run();
         }).detach();
     }
