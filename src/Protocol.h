@@ -19,11 +19,12 @@ const char*          leadName(Lead lead);
 std::optional<Lead>  parseLead(const std::string& token);
 
 struct Message {
+    // Time   — client's clock, first line of every connection (app → server); no reply.
     // Query  — cache probe (app → server), replied to with OK/no_data.
-    // Rhythm — the whole record's raw samples in one message (app → server).
-    // Start  — play command only (app → server); no reply.
+    // Rhythm — the whole record's raw samples in one message (app → server); acked.
+    // Start  — play command (app → server); acked.
     // Points — DEPRECATED: former streamed frames, still decodable for compat.
-    enum class Type { Query, Rhythm, Start, Stop, Points, Upload, Ack };
+    enum class Type { Time, Query, Rhythm, Start, Stop, Points, Upload, Ack };
 
     Type                       messageType = Type::Stop;
     std::optional<std::string> id;
@@ -31,6 +32,10 @@ struct Message {
     // Query / Rhythm — top-level identity of the rhythm.
     std::optional<std::string> pathology;
     std::optional<std::string> hash;        // Query only (cache key, §6)
+    std::optional<std::string> revision;    // Query / Rhythm — human-readable label (§6)
+
+    // Time
+    std::optional<std::string> datetime;    // ISO-8601 with UTC offset (§3.7)
 
     // Start / Rhythm
     std::optional<int>                  sampleRate;
@@ -49,13 +54,16 @@ struct Message {
     std::optional<long long>   size;
     std::optional<long long>   bytes;
 
+    static Message makeTime(std::optional<std::string> id, std::string datetime);
     static Message makeQuery(std::optional<std::string> id,
                              std::string                pathology,
-                             std::optional<std::string> hash = std::nullopt);
+                             std::optional<std::string> hash = std::nullopt,
+                             std::optional<std::string> revision = std::nullopt);
     static Message makeRhythm(std::optional<std::string> id,
                               std::string                pathology,
                               std::optional<int>         sampleRate,
-                              std::map<std::string, std::vector<int>> leads);
+                              std::map<std::string, std::vector<int>> leads,
+                              std::optional<std::string> revision = std::nullopt);
     static Message makeStart(std::optional<std::string> id = std::nullopt,
                              std::optional<int> sampleRate = std::nullopt,
                              std::map<std::string, std::string> params = {});

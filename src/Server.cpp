@@ -96,11 +96,12 @@ class ClientSession : public tts::IClientContext {
 public:
     ClientSession(socket_t s, std::string peer, bool quiet,
                   std::string uploadDir, long long maxUploadBytes,
-                  long long maxLineBytes,
+                  long long maxLineBytes, long long processDelayMs,
                   tts::RhythmCache* cache, tts::CommandDispatcher* dispatcher)
         : sock_(s), peer_(std::move(peer)), quiet_(quiet),
           uploadDir_(std::move(uploadDir)), maxUploadBytes_(maxUploadBytes),
-          maxLineBytes_(maxLineBytes), cache_(cache), dispatcher_(dispatcher) {}
+          maxLineBytes_(maxLineBytes), processDelayMs_(processDelayMs),
+          cache_(cache), dispatcher_(dispatcher) {}
 
     ClientSession(const ClientSession&)            = delete;
     ClientSession& operator=(const ClientSession&) = delete;
@@ -118,6 +119,7 @@ private:
     std::string             uploadDir_;
     long long               maxUploadBytes_;
     long long               maxLineBytes_;
+    long long               processDelayMs_;
     tts::RhythmCache*       cache_;
     tts::CommandDispatcher* dispatcher_;
 
@@ -129,7 +131,7 @@ private:
     // The (pathology, hash) of the most recent `query` we answered "no_data",
     // awaiting its single `rhythm` message (§3.3). The `rhythm` message itself
     // carries no hash, so we remember it here to key the cache entry (§6).
-    struct PendingQuery { std::string pathology; std::string hash; };
+    struct PendingQuery { std::string pathology; std::string hash; std::string revision; };
     std::optional<PendingQuery> pendingQuery_;
 
     // IClientContext
@@ -147,6 +149,7 @@ private:
     void handleQuery(const protocol::Message& msg);
     void handleRhythm(const protocol::Message& msg);
     void sendVerdict(bool cached, const std::optional<std::string>& id);
+    void sendAck(const std::optional<std::string>& id);
     void notifyHandler(const char* type, tts::json::Value payload);
 };
 
@@ -247,6 +250,16 @@ std::optional<ClientSession::PendingUpload> ClientSession::handleMessage(const p
         (msg.id ? " id=" + *msg.id : ""));
 
     switch (msg.messageType) {
+        case Message::Type::Time: {
+            // Client clock (§3.7), first line of the connection. Advisory — no
+            // reply (an extra reply would desync the first query's verdict).
+            const std::string dt = msg.datetime.value_or("");
+            log("[" + peer_ + "] time (client clock) " + dt);
+            tts::json::Value::Object p;
+            p["datetime"] = tts::json::Value(dt);
+            notifyHandler("time", tts::json::Value(std::move(p)));
+            return std::nullopt;
+        }
         case Message::Type::Query:
             handleQuery(msg);
             return std::nullopt;
@@ -254,13 +267,15 @@ std::optional<ClientSession::PendingUpload> ClientSession::handleMessage(const p
             handleRhythm(msg);
             return std::nullopt;
         case Message::Type::Start: {
-            // Play command only (§3.4) — no reply. Data was delivered earlier
-            // via the query/rhythm handshake.
+            // Play command (§3.4). The app waits for exactly one acknowledgement
+            // before it starts drawing, so ack every start. Data was delivered
+            // earlier via the query/rhythm handshake.
             auto it = msg.params.find("pathology");
             const std::string pathology = (it == msg.params.end()) ? std::string{} : it->second;
             const bool held = cache_ && cache_->get(pathology).has_value();
+            sendAck(msg.id);
             log("[" + peer_ + "] start (play) pathology='" + pathology + "'" +
-                (pathology.empty() ? "" : (held ? " [cached]" : " [NOT cached]")));
+                (pathology.empty() ? "" : (held ? " [cached]" : " [NOT cached]")) + " -> ack");
             tts::json::Value::Object p;
             p["pathology"] = tts::json::Value(pathology);
             p["held"]      = tts::json::Value(held);
@@ -268,6 +283,7 @@ std::optional<ClientSession::PendingUpload> ClientSession::handleMessage(const p
             return std::nullopt;
         }
         case Message::Type::Stop:
+            // Advisory (§3.5) — no reply.
             log("[" + peer_ + "] stop (monitor stopped)");
             notifyHandler("stop", tts::json::Value(tts::json::Value::Object{}));
             return std::nullopt;
@@ -292,56 +308,80 @@ std::optional<ClientSession::PendingUpload> ClientSession::handleMessage(const p
 void ClientSession::handleQuery(const protocol::Message& msg) {
     const std::string pathology = msg.pathology.value_or("");
     const std::string hash      = msg.hash.value_or("");
+    const std::string revision  = msg.revision.value_or("");
 
     const bool cached = cache_ && cache_->contains(pathology, hash);
     sendVerdict(cached, msg.id);
 
-    log("[" + peer_ + "] query pathology='" + pathology + "' hash='" + hash +
-        "' -> " + (cached ? "OK (cached)" : "no_data (need samples)"));
+    log("[" + peer_ + "] query pathology='" + pathology + "' rev='" + revision +
+        "' hash='" + hash + "' -> " + (cached ? "OK (cached)" : "no_data (need samples)"));
 
     // On no_data the app will send exactly one `rhythm` message next. Remember
-    // the queried (pathology, hash) so we can key its cache entry — `rhythm`
-    // itself carries no hash (§3.3).
+    // the queried (pathology, hash, revision) so we can key its cache entry —
+    // `rhythm` carries no hash (§3.3), and revision is a human-readable label (§6).
     pendingQuery_ = cached ? std::nullopt
-                           : std::optional<PendingQuery>(PendingQuery{pathology, hash});
+                           : std::optional<PendingQuery>(PendingQuery{pathology, hash, revision});
 
     tts::json::Value::Object p;
     p["pathology"] = tts::json::Value(pathology);
     p["hash"]      = tts::json::Value(hash);
+    p["revision"]  = tts::json::Value(revision);
     p["cached"]    = tts::json::Value(cached);
     notifyHandler("query", tts::json::Value(std::move(p)));
 }
 
 // rhythm — the whole record in one message (§3.3). Store every lead's raw ADC
 // samples in the shared cache, keyed by the (pathology, hash) from the query
-// that requested it, so the next query for that pair answers "OK".
+// that requested it, so the next query for that pair answers "OK", then send the
+// single required acknowledgement (§3.3, §4).
 void ClientSession::handleRhythm(const protocol::Message& msg) {
     const std::string pathology = msg.pathology.value_or("");
     const int sampleRate = msg.sampleRate.value_or(500);
 
     // The hash comes from the preceding no_data query; fall back to empty
     // (id-only caching) if the rhythm arrived without one (e.g. fail-open).
+    // The revision travels with the rhythm; fall back to the query's value.
     std::string hash;
-    if (pendingQuery_ && pendingQuery_->pathology == pathology) hash = pendingQuery_->hash;
+    std::string revision = msg.revision.value_or("");
+    if (pendingQuery_ && pendingQuery_->pathology == pathology) {
+        hash = pendingQuery_->hash;
+        if (revision.empty()) revision = pendingQuery_->revision;
+    }
     pendingQuery_.reset();
 
     size_t total = 0;
     for (const auto& kv : msg.leads) total += kv.second.size();
-    log("[" + peer_ + "] rhythm '" + pathology + "' hash='" + hash + "' (" +
-        std::to_string(msg.leads.size()) + " leads, " + std::to_string(total) +
-        " samples @ " + std::to_string(sampleRate) + " Hz)");
+
+    // Imitate the time a real server spends ingesting the record before it can
+    // acknowledge (on a local loopback the transfer itself is instant). Sleeps
+    // this session's thread only, so other clients are unaffected.
+    if (processDelayMs_ > 0) {
+        log("[" + peer_ + "] rhythm '" + pathology + "' rev='" + revision + "' hash='" + hash +
+            "' (" + std::to_string(msg.leads.size()) + " leads, " + std::to_string(total) +
+            " samples @ " + std::to_string(sampleRate) + " Hz) — processing " +
+            std::to_string(processDelayMs_) + " ms…");
+        std::this_thread::sleep_for(std::chrono::milliseconds(processDelayMs_));
+    }
 
     if (cache_ && !pathology.empty()) {
         RhythmCache::Rhythm stored;
         stored.hash       = hash;
+        stored.revision   = revision;
         stored.sampleRate = sampleRate;
         stored.leads      = msg.leads;
         cache_->store(pathology, std::move(stored));
     }
 
+    sendAck(msg.id);   // exactly one acknowledgement per rhythm (§4)
+
+    log("[" + peer_ + "] rhythm '" + pathology + "' rev='" + revision + "' hash='" + hash +
+        "' (" + std::to_string(msg.leads.size()) + " leads, " + std::to_string(total) +
+        " samples @ " + std::to_string(sampleRate) + " Hz) -> ack");
+
     tts::json::Value::Object p;
     p["pathology"]  = tts::json::Value(pathology);
     p["hash"]       = tts::json::Value(hash);
+    p["revision"]   = tts::json::Value(revision);
     p["leads"]      = tts::json::Value(static_cast<long long>(msg.leads.size()));
     p["samples"]    = tts::json::Value(static_cast<long long>(total));
     p["sampleRate"] = tts::json::Value(static_cast<long long>(sampleRate));
@@ -361,6 +401,12 @@ void ClientSession::sendVerdict(bool cached, const std::optional<std::string>& i
     } else {
         sendLine(cached ? "OK" : "no_data");
     }
+}
+
+// Acknowledge a `rhythm` or `start` with exactly one reply (§3.3, §3.4, §4):
+// {"id":…,"status":"ok"} when the request carried an id, else the bare "OK".
+void ClientSession::sendAck(const std::optional<std::string>& id) {
+    sendVerdict(true, id);
 }
 
 // Fire the optional extensibility hook after the mandatory reply has been sent.
@@ -567,7 +613,7 @@ int Server::run() {
         std::thread([cs, peerStr, this]() {
             ClientSession sess(cs, peerStr, opts_.quiet,
                                opts_.uploadDir, opts_.maxUploadBytes, opts_.maxLineBytes,
-                               opts_.cache, opts_.dispatcher);
+                               opts_.processDelayMs, opts_.cache, opts_.dispatcher);
             sess.run();
         }).detach();
     }

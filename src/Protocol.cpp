@@ -53,27 +53,39 @@ std::optional<Lead> parseLead(const std::string& token) {
     return std::nullopt;
 }
 
+Message Message::makeTime(std::optional<std::string> id, std::string datetime) {
+    Message m;
+    m.messageType = Type::Time;
+    m.id          = std::move(id);
+    m.datetime    = std::move(datetime);
+    return m;
+}
+
 Message Message::makeQuery(std::optional<std::string> id,
                            std::string                pathology,
-                           std::optional<std::string> hash) {
+                           std::optional<std::string> hash,
+                           std::optional<std::string> revision) {
     Message m;
     m.messageType = Type::Query;
     m.id          = std::move(id);
     m.pathology   = std::move(pathology);
     m.hash        = std::move(hash);
+    m.revision    = std::move(revision);
     return m;
 }
 
 Message Message::makeRhythm(std::optional<std::string> id,
                             std::string                pathology,
                             std::optional<int>         sampleRate,
-                            std::map<std::string, std::vector<int>> leads) {
+                            std::map<std::string, std::vector<int>> leads,
+                            std::optional<std::string> revision) {
     Message m;
     m.messageType = Type::Rhythm;
     m.id          = std::move(id);
     m.pathology   = std::move(pathology);
     m.sampleRate  = sampleRate;
     m.leads       = std::move(leads);
+    m.revision    = std::move(revision);
     return m;
 }
 
@@ -130,6 +142,7 @@ Message Message::makeAck(std::optional<std::string> id, std::optional<std::strin
 
 const char* Message::typeStr() const {
     switch (messageType) {
+        case Type::Time:   return "time";
         case Type::Query:  return "query";
         case Type::Rhythm: return "rhythm";
         case Type::Start:  return "start";
@@ -148,12 +161,17 @@ std::string encode(const Message& msg) {
     if (msg.id.has_value()) obj["id"] = Value(*msg.id);
 
     switch (msg.messageType) {
+        case Message::Type::Time:
+            if (msg.datetime) obj["datetime"] = Value(*msg.datetime);
+            break;
         case Message::Type::Query:
             if (msg.pathology) obj["pathology"] = Value(*msg.pathology);
+            if (msg.revision)  obj["revision"]  = Value(*msg.revision);
             if (msg.hash)      obj["hash"]      = Value(*msg.hash);
             break;
         case Message::Type::Rhythm: {
             if (msg.pathology) obj["pathology"] = Value(*msg.pathology);
+            if (msg.revision)  obj["revision"]  = Value(*msg.revision);
             if (msg.sampleRate.has_value()) {
                 obj["sampleRate"] = Value(static_cast<long long>(*msg.sampleRate));
             }
@@ -250,16 +268,24 @@ Message decode(const std::string& json) {
     if (!typeOpt) throw ProtocolError("Missing required field: type");
     auto id = getOptString(root, "id");
 
+    if (*typeOpt == "time") {
+        auto datetime = getOptString(root, "datetime");
+        if (!datetime) throw ProtocolError("Missing required field: datetime");
+        return Message::makeTime(id, *datetime);
+    }
     if (*typeOpt == "query") {
         auto pathology = getOptString(root, "pathology");
         if (!pathology) throw ProtocolError("Missing required field: pathology");
-        return Message::makeQuery(id, *pathology, getOptString(root, "hash"));
+        return Message::makeQuery(id, *pathology,
+                                  getOptString(root, "hash"),
+                                  getOptString(root, "revision"));
     }
     if (*typeOpt == "rhythm") {
         auto pathology = getOptString(root, "pathology");
         if (!pathology) throw ProtocolError("Missing required field: pathology");
         Message m = Message::makeRhythm(id, *pathology,
-                                        getOptNumber<int>(root, "sampleRate"), {});
+                                        getOptNumber<int>(root, "sampleRate"), {},
+                                        getOptString(root, "revision"));
         const auto* leads = root.find("leads");
         if (!leads || leads->isNull()) throw ProtocolError("Missing required field: leads");
         if (!leads->isObject())        throw ProtocolError("Field 'leads' must be object");

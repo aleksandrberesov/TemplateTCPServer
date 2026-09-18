@@ -31,6 +31,8 @@ void usage(const char* prog) {
         "  --upload-dir DIR    directory to save uploads  (default uploads)\n"
         "  --max-upload-mb N   reject uploads larger than N MB (default 100)\n"
         "  --max-line-mb N     reject JSON lines larger than N MB (default 64)\n"
+        "  --process-delay-ms N  simulated processing time per rhythm before ack\n"
+        "                        (default 1000; 0 disables; keep under 4000)\n"
         "  --quiet             reduce logging\n"
         "  -h, --help          show this help\n",
         prog);
@@ -57,6 +59,7 @@ int main(int argc, char** argv) {
         else if (a == "--upload-dir")    opts.uploadDir      = need("--upload-dir");
         else if (a == "--max-upload-mb") opts.maxUploadBytes = static_cast<long long>(std::atoi(need("--max-upload-mb"))) * 1024 * 1024;
         else if (a == "--max-line-mb")   opts.maxLineBytes   = static_cast<long long>(std::atoi(need("--max-line-mb"))) * 1024 * 1024;
+        else if (a == "--process-delay-ms") opts.processDelayMs = static_cast<long long>(std::atoi(need("--process-delay-ms")));
         else {
             std::fprintf(stderr, "Unknown option: %s\n", a.c_str());
             usage(argv[0]);
@@ -78,17 +81,25 @@ int main(int argc, char** argv) {
     // -----------------------------------------------------------------------
     // Optional observation hook.
     //
-    // After the server has sent any mandatory handshake reply, it invokes a
-    // handler keyed by the message type ("query", "rhythm", "start", "stop")
-    // with the decoded fields as its payload. Handlers here are for
-    // logging/metrics/etc. — they must NOT send OK/no_data themselves (the
-    // server already did, and an extra reply would desync the app's FIFO
+    // After the server has sent any mandatory reply, it invokes a handler keyed
+    // by the message type ("time", "query", "rhythm", "start", "stop") with the
+    // decoded fields as its payload. Handlers here are for logging/metrics/etc.
+    // — they must NOT send replies themselves (the server already sent the
+    // mandatory verdict/ack, and an extra reply would desync the app's FIFO
     // matching, §4).
     //
     // Add your own handlers below with registerHandler(); remove the dispatcher
     // wiring entirely if you don't need it.
     // -----------------------------------------------------------------------
     tts::CommandDispatcher dispatcher;
+
+    dispatcher.registerHandler("time",
+        [](const tts::json::Value& payload, tts::IClientContext& ctx) {
+            const auto* dt = payload.find("datetime");
+            std::string when = (dt && dt->isString()) ? dt->toString() : "<none>";
+            std::cout << "[hook] time — client clock: " << when
+                      << " | peer: " << ctx.peerAddress() << "\n";
+        });
 
     dispatcher.registerHandler("query",
         [](const tts::json::Value& payload, tts::IClientContext& ctx) {

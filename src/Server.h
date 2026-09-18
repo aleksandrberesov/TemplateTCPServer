@@ -18,6 +18,11 @@ struct Options {
     // Max size of a single JSON line. A `rhythm` message carries every lead's
     // raw samples on one line and can be large, so this is generous.
     long long   maxLineBytes    = 64LL * 1024 * 1024;
+    // Simulated processing time for a received `rhythm` (the data payload):
+    // the session sleeps this long before acknowledging it, to imitate real
+    // server-side work on a local loopback where everything is otherwise
+    // instant. Keep it under the app's 4 s ack timeout (§4). 0 disables it.
+    long long   processDelayMs  = 1000;
 
     // Shared rhythm cache backing the §4 handshake — not owned by Options.
     // Set this before calling Server::run() so every client session shares one

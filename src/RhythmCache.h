@@ -22,7 +22,8 @@ class RhythmCache {
 public:
     // One rhythm's samples, delivered in a single `rhythm` message (§3.3).
     struct Rhythm {
-        std::string hash;                                  // content fingerprint (§6)
+        std::string hash;                                  // content fingerprint (§6, cache key)
+        std::string revision;                              // human-readable version label (§6)
         int         sampleRate = 500;                      // samples per second
         std::map<std::string, std::vector<int>> leads;     // lead token -> raw ADC samples
     };

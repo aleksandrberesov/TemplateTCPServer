@@ -5,11 +5,23 @@ protocol](../CardioSimulator/Win/docs/tcp-protocol.md). It is intended for
 end-to-end testing the CardioSimulator client and any other component that
 consumes the protocol — not for medical use.
 
-The app is the client: it connects out, uploads the rhythm catalog
-(`manifest.txt`), and then — **on each rhythm the user selects** — asks whether
-the server already holds that rhythm and, only if it doesn't, sends the whole
-rhythm's raw samples in **one message**. This server implements the
+The app is the client: it connects out, sends its clock, uploads the rhythm
+catalog (`manifest.txt`), and then — **on each rhythm the user selects** — asks
+whether the server already holds that rhythm and, only if it doesn't, sends the
+whole rhythm's raw samples in **one message**. This server implements the
 receiving/monitor side of that contract.
+
+Which messages get a reply is exact and FIFO-ordered — a missing or extra reply
+shifts every later match — so:
+
+| Message | Direction | Server reply |
+|---|---|---|
+| `time`   | app → server | **none** (advisory clock, first line) |
+| `upload` | app → server | JSON `ack` echoing the id (or nothing) — never `OK`/`no_data` |
+| `query`  | app → server | exactly one: `OK` (held) or `no_data` (send it) |
+| `rhythm` | app → server | exactly one ack: `OK` / `{"id":…,"status":"ok"}` |
+| `start`  | app → server | exactly one ack: `OK` / `{"id":…,"status":"ok"}` |
+| `stop`   | app → server | **none** (advisory) |
 
 Behavior:
 
@@ -17,22 +29,26 @@ Behavior:
   clients. Each connection decodes one JSON object per `\n`-terminated line.
   A `rhythm` line can be large (every lead in one message), so long lines are
   read without a small fixed buffer.
+- On `time` (first line each connection), logs the client's clock — no reply.
 - On `upload` (`manifest.txt`), reads exactly `size` raw bytes into the upload
-  directory and replies with an `ack` (never `OK`/`no_data`).
-- On `query` — the **cache probe** — replies with exactly one line: `no_data`
-  when it doesn't hold that `(pathology, hash)` pair (so the app sends the
-  data), or `OK` when it already does (so the app sends nothing). The request
-  `id` is echoed as `{"id":…,"status":…}` when present.
+  directory and replies with a JSON `ack`.
+- On `query` — the **cache probe** — replies `no_data` when it doesn't hold that
+  `(pathology, hash)` pair, or `OK` when it already does; the `id` is echoed as
+  `{"id":…,"status":…}` when present.
 - On `rhythm` (sent only after a `no_data`), stores every lead's **raw ADC
   integer** samples in the shared cache, keyed by the queried `(pathology,
-  hash)`, so an unchanged rhythm is never re-requested — even across reconnects.
-- On `start` — the **play** command (start button) — logs and moves on; it
-  carries no data and gets no reply. On `stop`, logs (advisory).
+  hash)` and labelled with its `revision`, so an unchanged rhythm is never
+  re-requested — even across reconnects — then sends the required ack.
+- On `start` — the **play** command (start button, and after a `stop` when the
+  user switches rhythm while playing) — acks so the app can begin drawing.
+- On `stop`, logs (advisory, no reply).
 - `points` (the old streamed per-lead frames) is **deprecated** and ignored.
 - Logs every decoded message and every protocol error.
 
 The cache is keyed by `(pathology, hash)`: same id + same hash → `OK`; same id +
-new hash (an **edited** rhythm) → `no_data`, so the app resends it.
+new hash (an **edited** rhythm) → `no_data`, so the app resends it. `revision`
+is a human-readable version label (`"0"` = as shipped), stored and logged but
+not used as the key.
 
 ## Layout
 
@@ -120,11 +136,11 @@ If you have `mingw-w64` installed on Linux (`apt install mingw-w64` /
 ```
 TemplateTCPServer listening on 0.0.0.0:9000
 [127.0.0.1:55720] connected
-[127.0.0.1:55720] recv: upload id=u1
+[127.0.0.1:55720] time (client clock) 2026-09-18T13:35:12.345+03:00
 [127.0.0.1:55720] upload complete: manifest.txt (8123 bytes)
-[127.0.0.1:55720] query pathology='afib' hash='9f3c1a20b7e4d5c8' -> no_data (need samples)
-[127.0.0.1:55720] rhythm 'afib' hash='9f3c1a20b7e4d5c8' (12 leads, 6000 samples @ 500 Hz)
-[127.0.0.1:55720] start (play) pathology='afib' [cached]
+[127.0.0.1:55720] query pathology='afib' rev='0' hash='9f3c1a20b7e4d5c8' -> no_data (need samples)
+[127.0.0.1:55720] rhythm 'afib' rev='0' hash='9f3c1a20b7e4d5c8' (12 leads, 6000 samples @ 500 Hz) -> ack
+[127.0.0.1:55720] start (play) pathology='afib' [cached] -> ack
 [127.0.0.1:55720] disconnected
 ```
 
@@ -137,8 +153,17 @@ TemplateTCPServer listening on 0.0.0.0:9000
 | `--upload-dir`     | `uploads` | Directory to save uploads (e.g. `manifest.txt`) |
 | `--max-upload-mb`  | `100`     | Reject uploads larger than N MB                 |
 | `--max-line-mb`    | `64`      | Reject a single JSON line larger than N MB      |
+| `--process-delay-ms` | `1000`  | Simulated processing time per `rhythm` before its ack (0 disables; keep under 4000) |
 | `--quiet`          | off       | Suppress per-message logging                    |
 | `-h`, `--help`     |           | Show usage                                      |
+
+The server does nothing with the sample data itself. Because the app and this
+server usually run on **one local machine**, a received `rhythm` would otherwise
+be acknowledged instantly; `--process-delay-ms` makes the session sleep that
+long before acking, to imitate the time a real server spends ingesting a record.
+Only the `rhythm` (the data payload) is delayed — `query` verdicts and `start`
+acks stay immediate — and the delay blocks only that one client's session. Keep
+it under the app's 4 s ack timeout (§4) or the app fails open and moves on.
 
 ## Smoke test
 
@@ -172,12 +197,13 @@ This server implements:
   `rhythm` lines included), plus the raw-binary `upload` payload framing (read
   exactly `size` bytes, then resume line parsing — bytes pipelined after the
   payload, such as the `query` the app sends right after the manifest, are kept).
-- decoder: `query`, `rhythm`, `start`, `stop`, `upload`, `ack` (and the
+- decoder: `time`, `query`, `rhythm`, `start`, `stop`, `upload`, `ack` (and the
   deprecated `points`); rejects unknown `type`, malformed JSON, a missing
-  `pathology`/`leads`, and unknown lead tokens.
-- handshake: one `OK`/`no_data` reply per `query` in socket order, newline
-  terminated, echoing the request `id` when present; the `manifest.txt` upload
-  gets an `ack`, never a verdict.
+  `datetime`/`pathology`/`leads`, and unknown lead tokens.
+- handshake: exactly one reply per `query` (verdict), `rhythm` (ack) and `start`
+  (ack), in socket order, newline terminated, echoing the request `id` when
+  present; **no** reply to `time` or `stop`, and a JSON `ack` (never a verdict)
+  for the `manifest.txt` upload.
 - cache: keyed by `(pathology, hash)`, shared across all sessions and surviving
   reconnects. The `rhythm` message carries no hash, so the server keys each
   entry by the `(pathology, hash)` from the `query` that requested it.
