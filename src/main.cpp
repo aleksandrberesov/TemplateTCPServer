@@ -7,11 +7,37 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
-#include <string>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include <fstream>
 
 namespace {
 
 tts::server::Server* g_server = nullptr;
+
+void broadcastToEmulator(const std::string& jsonLine) {
+#ifdef _WIN32
+    HANDLE hPipe = CreateFileA(
+        "\\\\.\\pipe\\CardioEmulatorPipe",
+        GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL);
+    if (hPipe != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(hPipe, jsonLine.data(), static_cast<DWORD>(jsonLine.size()), &written, NULL);
+        CloseHandle(hPipe);
+    }
+#endif
+    // Also save as active_rhythm.json as IPC fallback
+    std::ofstream out("active_rhythm.json");
+    if (out.is_open()) {
+        out << jsonLine;
+    }
+}
 
 void onSignal(int) {
     if (g_server) g_server->stop();
@@ -113,16 +139,38 @@ int main(int argc, char** argv) {
         });
 
     dispatcher.registerHandler("start",
-        [](const tts::json::Value& payload, tts::IClientContext& ctx) {
+        [&cache](const tts::json::Value& payload, tts::IClientContext& ctx) {
             const auto* pathology = payload.find("pathology");
             std::string id = (pathology && pathology->isString()) ? pathology->toString() : "<none>";
             std::cout << "[hook] start (play) — rhythm: " << id
                       << " | peer: " << ctx.peerAddress() << "\n";
+
+            auto stored = cache.get(id);
+            if (stored) {
+                std::string json = "{\"type\":\"start\",\"pathology\":\"" + id +
+                                   "\",\"sampleRate\":" + std::to_string(stored->sampleRate) +
+                                   ",\"leads\":{";
+                bool firstLead = true;
+                for (const auto& kv : stored->leads) {
+                    if (!firstLead) json += ",";
+                    firstLead = false;
+                    json += "\"" + kv.first + "\":[";
+                    for (size_t i = 0; i < kv.second.size(); ++i) {
+                        if (i > 0) json += ",";
+                        json += std::to_string(kv.second[i]);
+                    }
+                    json += "]";
+                }
+                json += "}}\n";
+                broadcastToEmulator(json);
+                std::cout << "[emulator-ipc] broadcast rhythm '" << id << "' to emulator\n";
+            }
         });
 
     dispatcher.registerHandler("stop",
         [](const tts::json::Value&, tts::IClientContext& ctx) {
             std::cout << "[hook] stop — monitor stopped | peer: " << ctx.peerAddress() << "\n";
+            broadcastToEmulator("{\"type\":\"stop\"}\n");
         });
 
     opts.dispatcher = &dispatcher;
